@@ -4,6 +4,7 @@ ComfyUI Memory Cleaner — CPU 工作集清理 + GPU 显存清理
 """
 
 import gc
+import os
 import ctypes
 import ctypes.wintypes
 import psutil
@@ -60,11 +61,28 @@ PROCESS_QUERY_INFORMATION = 0x0400
 # ══════════════════════════════════════════════════════════
 
 def trim_self() -> bool:
-    """对当前进程执行 EmptyWorkingSet（伪句柄，无需 OpenProcess）"""
+    """对当前进程执行 EmptyWorkingSet（用 OpenProcess 获取权限更好的句柄）"""
     try:
-        h = GetCurrentProcess()
-        return bool(SetProcessWorkingSetSize(h, -1, -1))
-    except Exception:
+        # 用 OpenProcess 代替伪句柄，避免部分环境下权限不够
+        pid = os.getpid()
+        h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, pid)
+        if not h:
+            print(f"[MemoryCleaner] OpenProcess 失败: {ctypes.GetLastError()}")
+            # 回退到伪句柄
+            h2 = GetCurrentProcess()
+            for _ in range(3):
+                SetProcessWorkingSetSize(h2, -1, -1)
+            return True
+
+        # 多轮清理 + 中间插 GC 更有效
+        for _ in range(3):
+            SetProcessWorkingSetSize(h, -1, -1)
+            gc.collect(0)
+
+        CloseHandle(h)
+        return True
+    except Exception as e:
+        print(f"[MemoryCleaner] trim_self 异常: {e}")
         return False
 
 
@@ -212,6 +230,10 @@ class MemoryCleaner:
         if mode in ("cpu+gpu", "cpu_only"):
             lines.append(f"RSS  : {before['rss_mb']}MB → {after['rss_mb']}MB  (释放 {freed_ram}MB)")
             lines.append(f"进程 : {cpu_cleared}/{len(cpu_results or [])} 成功")
+
+            # 如果释放为 0，显示提示
+            if freed_ram < 0.1 and cpu_cleared > 0:
+                lines.append("⚠️ 工作集已最小化，无更多可分页内存")
 
         # GPU 部分
         if mode in ("cpu+gpu", "gpu_only") and before["gpu"]:
