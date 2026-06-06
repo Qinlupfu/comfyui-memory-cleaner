@@ -157,6 +157,10 @@ class MemoryCleaner:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "run":        ("BOOLEAN", {"default": True,
+                                           "label_on": "执行清理",
+                                           "label_off": "待命",
+                                           "tooltip": "切换此开关触发清理"}),
                 "mode":       (cls.MODES, {"default": "cpu+gpu",
                                            "tooltip": "清理模式: CPU工作集 / GPU显存 / 两者"}),
                 "gc_collect": (cls.GC_OPTIONS, {"default": "yes",
@@ -173,7 +177,7 @@ class MemoryCleaner:
     FUNCTION = "clean"
     CATEGORY = "utils/memory"
 
-    def clean(self, anything=None, mode="cpu+gpu", gc_collect="yes"):
+    def clean(self, run=True, anything=None, mode="cpu+gpu", gc_collect="yes"):
         before = get_memory_info()
 
         # ── 1. Python GC ──────────────────────────────────
