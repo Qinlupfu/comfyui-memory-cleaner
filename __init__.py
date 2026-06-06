@@ -1,15 +1,17 @@
 """
-ComfyUI Memory Cleaner — CPU 工作集清理 + GPU 显存清理
+ComfyUI Memory Cleaner — PCL 同款：启子进程从外部清理父进程
 放到 ComfyUI/custom_nodes/comfyui-memory-cleaner/ 目录下即可
 """
 
 import gc
 import os
+import sys
+import subprocess
 import ctypes
 import ctypes.wintypes
 import psutil
 
-# ── torch 可选（无 GPU 环境不报错） ────────────────────
+# ── torch 可选 ──────────────────────────────────────────
 try:
     import torch
     HAS_TORCH = True
@@ -19,77 +21,62 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════
-#  Win32 API — 模块级别一次性定义
-# ══════════════════════════════════════════════════════════
-kernel32 = ctypes.windll.kernel32
-
-# SIZE_T SetProcessWorkingSetSize(HANDLE, SIZE_T, SIZE_T)
-# 传入 (hProcess, -1, -1) 即为 EmptyWorkingSet 效果
-SetProcessWorkingSetSize = kernel32.SetProcessWorkingSetSize
-SetProcessWorkingSetSize.argtypes = [
-    ctypes.wintypes.HANDLE,
-    ctypes.c_size_t,
-    ctypes.c_size_t,
-]
-SetProcessWorkingSetSize.restype = ctypes.wintypes.BOOL
-
-# HANDLE GetCurrentProcess()  → 伪句柄，不用 CloseHandle
-GetCurrentProcess = kernel32.GetCurrentProcess
-GetCurrentProcess.restype = ctypes.wintypes.HANDLE
-
-# HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId)
-OpenProcess = kernel32.OpenProcess
-OpenProcess.argtypes = [
-    ctypes.wintypes.DWORD,
-    ctypes.wintypes.BOOL,
-    ctypes.wintypes.DWORD,
-]
-OpenProcess.restype = ctypes.wintypes.HANDLE
-
-# BOOL CloseHandle(HANDLE hObject)
-CloseHandle = kernel32.CloseHandle
-CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
-CloseHandle.restype = ctypes.wintypes.BOOL
-
-# ── 常量 ──────────────────────────────────────────────
-PROCESS_SET_QUOTA       = 0x0100
-PROCESS_QUERY_INFORMATION = 0x0400
-
-
-# ══════════════════════════════════════════════════════════
-#  底层操作
+#  底层操作 — 子进程清理父进程（PCL 同款手法）
 # ══════════════════════════════════════════════════════════
 
-def trim_self() -> bool:
-    """对当前进程执行 EmptyWorkingSet（用 OpenProcess 获取权限更好的句柄）"""
+def trim_via_subprocess():
+    """
+    启动子进程对父进程执行 EmptyWorkingSet
+    — 和 PCL 一样：从一个进程去清理另一个进程
+    — 比自清理有效得多，因为子进程打开父进程时有完整的 PRO сESS_SET_QUOTA 权限
+    """
+    pid = os.getpid()
+    script = (
+        "import ctypes;"
+        "k32=ctypes.windll.kernel32;"
+        f"h=k32.OpenProcess(0x0100,False,{pid});"
+        "k32.SetProcessWorkingSetSize(h,ctypes.c_size_t(-1),ctypes.c_size_t(-1));"
+        "k32.CloseHandle(h)"
+    )
     try:
-        # 用 OpenProcess 代替伪句柄，避免部分环境下权限不够
-        pid = os.getpid()
-        h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, pid)
-        if not h:
-            print(f"[MemoryCleaner] OpenProcess 失败: {ctypes.GetLastError()}")
-            # 回退到伪句柄
-            h2 = GetCurrentProcess()
-            for _ in range(3):
-                SetProcessWorkingSetSize(h2, -1, -1)
-            return True
-
-        # 多轮清理 + 中间插 GC 更有效
-        for _ in range(3):
-            SetProcessWorkingSetSize(h, -1, -1)
-            gc.collect(0)
-
-        CloseHandle(h)
-        return True
-    except Exception as e:
-        print(f"[MemoryCleaner] trim_self 异常: {e}")
+        # CREATE_NO_WINDOW = 0x08000000 → 不弹黑窗口
+        flags = 0x08000000
+        r = subprocess.run(
+            [sys.executable, "-c", script],
+            creationflags=flags,
+            timeout=10,
+            capture_output=True,
+        )
+        return r.returncode == 0
+    except Exception:
         return False
 
 
-def trim_process(pid: int) -> bool:
-    """对指定 PID 执行 EmptyWorkingSet（通过 OpenProcess 获取句柄）"""
+def trim_subprocesses():
+    """清理所有子进程的工作集"""
     try:
-        h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, pid)
+        current = psutil.Process()
+        for child in current.children(recursive=True):
+            _trim_external(child.pid)
+    except Exception:
+        pass
+
+
+def _trim_external(pid: int) -> bool:
+    """从本进程清理另一个进程（类似 PCL 清理非自身进程）"""
+    try:
+        OpenProcess = ctypes.windll.kernel32.OpenProcess
+        OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
+        OpenProcess.restype = ctypes.wintypes.HANDLE
+        CloseHandle = ctypes.windll.kernel32.CloseHandle
+        CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+        CloseHandle.restype = ctypes.wintypes.BOOL
+        SetProcessWorkingSetSize = ctypes.windll.kernel32.SetProcessWorkingSetSize
+        SetProcessWorkingSetSize.argtypes = [ctypes.wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t]
+        SetProcessWorkingSetSize.restype = ctypes.wintypes.BOOL
+
+        PROCESS_SET_QUOTA = 0x0100
+        h = OpenProcess(PROCESS_SET_QUOTA, False, pid)
         if not h:
             return False
         ok = SetProcessWorkingSetSize(h, -1, -1)
@@ -99,33 +86,11 @@ def trim_process(pid: int) -> bool:
         return False
 
 
-def trim_all_comfyui():
-    """清理整个 ComfyUI 进程树的 CPU 工作集"""
-    current = psutil.Process()
-    results = []
-
-    # 主进程（伪句柄）
-    ok = trim_self()
-    results.append((current.pid, ok, "self"))
-
-    # 所有子进程
-    try:
-        children = current.children(recursive=True)
-        for child in children:
-            ok = trim_process(child.pid)
-            results.append((child.pid, ok, "child" if ok else "child (failed)"))
-    except Exception:
-        pass
-
-    return results
-
-
 # ══════════════════════════════════════════════════════════
 #  内存信息采集
 # ══════════════════════════════════════════════════════════
 
 def get_memory_info():
-    """获取 CPU + GPU 内存当前占用"""
     proc = psutil.Process()
     mem = proc.memory_info()
     info = {
@@ -157,15 +122,12 @@ def get_memory_info():
 
 class MemoryCleaner:
     """
-    清内存节点
+    清内存节点 — PCL 同款手法
 
-    CPU 模式 — 调用 EmptyWorkingSet (SetProcessWorkingSetSize) 把闲置
-              物理内存页踢出 RAM，释放给系统。
-    GPU 模式 — 调用 torch.cuda.empty_cache() + ipc_collect() 释放
-              PyTorch 缓存的未使用显存块。
-    CPU+GPU  —— 两件事都做。
-
-    不影响模型加载/生成过程，只是把"站着坑不拉屎"的页清掉。
+    CPU 模式 — 启动子进程对 ComfyUI 执行 EmptyWorkingSet，
+              把闲置物理内存页踢出 RAM（和 PCL 清理别的进程一样）。
+    GPU 模式 — torch.cuda.empty_cache() + ipc_collect()
+    CPU+GPU  — 两件事都做。
     """
 
     MODES = ["cpu+gpu", "cpu_only", "gpu_only"]
@@ -202,10 +164,11 @@ class MemoryCleaner:
         if gc_collect == "yes":
             gc.collect(2)
 
-        # ── 2. CPU 工作集清理 ─────────────────────────────
-        cpu_results = []
+        # ── 2. CPU 工作集清理（子进程清理，PCL 同款） ─────
+        cpu_ok = False
         if mode in ("cpu+gpu", "cpu_only"):
-            cpu_results = trim_all_comfyui()
+            cpu_ok = trim_via_subprocess()
+            trim_subprocesses()
 
         # ── 3. GPU 显存清理 ───────────────────────────────
         gpu_freed = []
@@ -218,24 +181,18 @@ class MemoryCleaner:
                 after_gpu = torch.cuda.memory_allocated(i)
                 gpu_freed.append(round((before_gpu - after_gpu) / 1024 / 1024, 1))
 
-        # ── 4. 采集清理后的状态 ───────────────────────────
+        # ── 4. 报告 ──────────────────────────────────────
         after = get_memory_info()
         freed_ram = round(before["rss_mb"] - after["rss_mb"], 1)
-        cpu_cleared = sum(1 for _, ok, _ in cpu_results if ok)
 
-        # ── 5. 组装报告 ──────────────────────────────────
         lines = ["内存清理完成", "━━━━━━━━━━━━━━"]
 
-        # CPU 部分
         if mode in ("cpu+gpu", "cpu_only"):
-            lines.append(f"RSS  : {before['rss_mb']}MB → {after['rss_mb']}MB  (释放 {freed_ram}MB)")
-            lines.append(f"进程 : {cpu_cleared}/{len(cpu_results or [])} 成功")
+            status = "✅" if cpu_ok else "❌"
+            lines.append(f"CPU {status}: {before['rss_mb']}MB → {after['rss_mb']}MB  (释放 {freed_ram}MB)")
+            if freed_ram < 0.1 and cpu_ok:
+                lines.append("⚠️ 无更多可分页内存（模型/mmap 占用不可分页）")
 
-            # 如果释放为 0，显示提示
-            if freed_ram < 0.1 and cpu_cleared > 0:
-                lines.append("⚠️ 工作集已最小化，无更多可分页内存")
-
-        # GPU 部分
         if mode in ("cpu+gpu", "gpu_only") and before["gpu"]:
             for idx, g in enumerate(before["gpu"]):
                 gf = gpu_freed[idx] if idx < len(gpu_freed) else 0
