@@ -1,5 +1,5 @@
 """
-ComfyUI Memory Cleaner — 跟 PCL 一样用 EmptyWorkingSet 清内存
+ComfyUI Memory Cleaner — 用 SetProcessWorkingSetSize 清内存
 放到 ComfyUI/custom_nodes/comfyui-memory-cleaner/ 目录下即可
 """
 
@@ -8,37 +8,51 @@ import ctypes
 import ctypes.wintypes
 import psutil
 
-# ── Win32 API 定义 ────────────────────────────────────
+# ── Win32 API ──────────────────────────────────────────
 kernel32 = ctypes.windll.kernel32
 
-# HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId)
-OpenProcess = kernel32.OpenProcess
-OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
-OpenProcess.restype = ctypes.wintypes.HANDLE
+# SIZE_T SetProcessWorkingSetSize(HANDLE, SIZE_T, SIZE_T)
+# 传入 (hProcess, -1, -1) 即为 EmptyWorkingSet 效果
+SetProcessWorkingSetSize = kernel32.SetProcessWorkingSetSize
+SetProcessWorkingSetSize.argtypes = [
+    ctypes.wintypes.HANDLE,
+    ctypes.c_size_t,
+    ctypes.c_size_t,
+]
+SetProcessWorkingSetSize.restype = ctypes.wintypes.BOOL
 
-# BOOL EmptyWorkingSet(HANDLE hProcess)
-EmptyWorkingSet = kernel32.EmptyWorkingSet
-EmptyWorkingSet.argtypes = [ctypes.wintypes.HANDLE]
-EmptyWorkingSet.restype = ctypes.wintypes.BOOL
+# HANDLE GetCurrentProcess()
+GetCurrentProcess = kernel32.GetCurrentProcess
+GetCurrentProcess.restype = ctypes.wintypes.HANDLE
 
-# BOOL CloseHandle(HANDLE hObject)
-CloseHandle = kernel32.CloseHandle
-CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
-CloseHandle.restype = ctypes.wintypes.BOOL
 
-PROCESS_QUERY_INFORMATION = 0x0400
-PROCESS_SET_QUOTA = 0x0100
+def trim_self() -> bool:
+    """对当前进程执行 EmptyWorkingSet（直接用伪句柄，不需要 OpenProcess）"""
+    try:
+        h = GetCurrentProcess()          # 伪句柄，不用 CloseHandle
+        return bool(SetProcessWorkingSetSize(h, -1, -1))
+    except Exception:
+        return False
 
 
 def trim_process(pid: int) -> bool:
-    """对单个进程执行 EmptyWorkingSet"""
+    """对指定 PID 进程执行 EmptyWorkingSet（用 OpenProcess）"""
     try:
+        PROCESS_SET_QUOTA = 0x0100
+        PROCESS_QUERY_INFORMATION = 0x0400
+        OpenProcess = kernel32.OpenProcess
+        OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
+        OpenProcess.restype = ctypes.wintypes.HANDLE
+        CloseHandle = kernel32.CloseHandle
+        CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+        CloseHandle.restype = ctypes.wintypes.BOOL
+
         h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, pid)
         if not h:
             return False
-        result = EmptyWorkingSet(h)
+        ok = SetProcessWorkingSetSize(h, -1, -1)
         CloseHandle(h)
-        return bool(result)
+        return bool(ok)
     except Exception:
         return False
 
@@ -48,16 +62,16 @@ def trim_all_comfyui():
     current = psutil.Process()
     results = []
 
-    # 清理主进程
-    ok = trim_process(current.pid)
-    results.append((current.pid, ok))
+    # 清理主进程（用伪句柄）
+    ok = trim_self()
+    results.append((current.pid, ok, "self"))
 
-    # 清理所有子进程（如果有 spawn 的子进程）
+    # 清理所有子进程
     try:
         children = current.children(recursive=True)
         for child in children:
             ok = trim_process(child.pid)
-            results.append((child.pid, ok))
+            results.append((child.pid, ok, "child"))
     except Exception:
         pass
 
@@ -65,7 +79,7 @@ def trim_all_comfyui():
 
 
 def get_memory_info():
-    """获取当前内存占用，用于节点输出展示"""
+    """获取当前内存占用"""
     proc = psutil.Process()
     mem = proc.memory_info()
     return {
@@ -76,7 +90,7 @@ def get_memory_info():
 
 class MemoryCleaner:
     """
-    PCL 同款清内存节点 — 调用 Windows EmptyWorkingSet API
+    清内存节点 — 调用 Windows SetProcessWorkingSetSize(h, -1, -1)
     把 ComfyUI 闲置内存页踢出物理内存，释放给系统。
 
     不影响模型加载 / 生成过程，只是把"站着坑不拉屎"的页清掉。
@@ -104,12 +118,12 @@ class MemoryCleaner:
         if gc_collect == "yes":
             gc.collect()
 
-        # 2. EmptyWorkingSet — PCL 同款核心操作
+        # 2. EmptyWorkingSet
         results = trim_all_comfyui()
 
         after = get_memory_info()
         freed = round(before["rss_mb"] - after["rss_mb"], 1)
-        cleared = sum(1 for _, ok in results if ok)
+        cleared = sum(1 for _, ok, _ in results if ok)
 
         report = (
             f"内存清理完成\n"
