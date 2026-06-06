@@ -157,11 +157,13 @@ class MemoryCleaner:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "anything":   ("*", {"tooltip": "接任意输入，触发清除"}),
                 "mode":       (cls.MODES, {"default": "cpu+gpu",
                                            "tooltip": "清理模式: CPU工作集 / GPU显存 / 两者"}),
                 "gc_collect": (cls.GC_OPTIONS, {"default": "yes",
                                                 "tooltip": "额外执行 Python gc.collect(2)"}),
+            },
+            "optional": {
+                "anything":   ("*", {"tooltip": "可接任意节点，接入时原样透传"}),
             },
         }
 
