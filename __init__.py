@@ -21,6 +21,33 @@ except ImportError:
 
 
 # ══════════════════════════════════════════════════════════
+#  Win32 API — 模块级一次性定义，避免每个函数内部重复 ctypes 声明
+# ══════════════════════════════════════════════════════════
+kernel32 = ctypes.windll.kernel32
+
+# HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId)
+OpenProcess = kernel32.OpenProcess
+OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
+OpenProcess.restype = ctypes.wintypes.HANDLE
+
+# BOOL CloseHandle(HANDLE hObject)
+CloseHandle = kernel32.CloseHandle
+CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+CloseHandle.restype = ctypes.wintypes.BOOL
+
+# SIZE_T SetProcessWorkingSetSize(HANDLE, SIZE_T, SIZE_T)
+# 传入 (hProcess, -1, -1) 即为 EmptyWorkingSet 效果
+SetProcessWorkingSetSize = kernel32.SetProcessWorkingSetSize
+SetProcessWorkingSetSize.argtypes = [ctypes.wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t]
+SetProcessWorkingSetSize.restype = ctypes.wintypes.BOOL
+
+# 常量
+PROCESS_SET_QUOTA        = 0x0100
+PROCESS_QUERY_INFORMATION = 0x0400
+PROCESS_ACCESS = PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION
+
+
+# ══════════════════════════════════════════════════════════
 #  底层操作 — 子进程清理父进程（PCL 同款手法）
 # ══════════════════════════════════════════════════════════
 
@@ -28,13 +55,13 @@ def trim_via_subprocess():
     """
     启动子进程对父进程执行 EmptyWorkingSet
     — 和 PCL 一样：从一个进程去清理另一个进程
-    — 比自清理有效得多，因为子进程打开父进程时有完整的 PRO сESS_SET_QUOTA 权限
+    — 比自清理有效得多，子进程 OpenProcess 父进程拥有完整访问权限
     """
     pid = os.getpid()
     script = (
         "import ctypes;"
         "k32=ctypes.windll.kernel32;"
-        f"h=k32.OpenProcess(0x0100,False,{pid});"
+        f"h=k32.OpenProcess(0x0500,False,{pid});"
         "k32.SetProcessWorkingSetSize(h,ctypes.c_size_t(-1),ctypes.c_size_t(-1));"
         "k32.CloseHandle(h)"
     )
@@ -63,20 +90,9 @@ def trim_subprocesses():
 
 
 def _trim_external(pid: int) -> bool:
-    """从本进程清理另一个进程（类似 PCL 清理非自身进程）"""
+    """从本进程清理另一个进程（类似 PCL 清理非自身进程）—— 使用模块级 API"""
     try:
-        OpenProcess = ctypes.windll.kernel32.OpenProcess
-        OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
-        OpenProcess.restype = ctypes.wintypes.HANDLE
-        CloseHandle = ctypes.windll.kernel32.CloseHandle
-        CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
-        CloseHandle.restype = ctypes.wintypes.BOOL
-        SetProcessWorkingSetSize = ctypes.windll.kernel32.SetProcessWorkingSetSize
-        SetProcessWorkingSetSize.argtypes = [ctypes.wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t]
-        SetProcessWorkingSetSize.restype = ctypes.wintypes.BOOL
-
-        PROCESS_SET_QUOTA = 0x0100
-        h = OpenProcess(PROCESS_SET_QUOTA, False, pid)
+        h = OpenProcess(PROCESS_ACCESS, False, pid)
         if not h:
             return False
         ok = SetProcessWorkingSetSize(h, -1, -1)
@@ -158,6 +174,9 @@ class MemoryCleaner:
     CATEGORY = "utils/memory"
 
     def clean(self, run=True, anything=None, mode="cpu+gpu", gc_collect="yes"):
+        if not run:
+            return (anything, "⏸ 待命中，未执行清理")
+
         before = get_memory_info()
 
         # ── 1. Python GC ──────────────────────────────────
